@@ -1,11 +1,16 @@
 use std::{collections::HashMap, sync::Arc};
 
-use crate::{ai::agent::redaction, terminal::model::session::SessionType};
+use crate::{
+    ai::agent::{redaction, AIAgentInput},
+    terminal::model::session::SessionType,
+};
 use futures_util::StreamExt;
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 use warp_core::features::FeatureFlag;
 use warp_multi_agent_api as api;
 
-use crate::server::server_api::ServerApi;
+use crate::server::server_api::{AIApiError, ServerApi};
 
 use super::{convert_to::convert_input, ConvertToAPITypeError, RequestParams, ResponseStream};
 
@@ -14,6 +19,25 @@ pub async fn generate_multi_agent_output(
     mut params: RequestParams,
     cancellation_rx: futures::channel::oneshot::Receiver<()>,
 ) -> Result<ResponseStream, ConvertToAPITypeError> {
+    if let Some(local_config) = params.local_openai_config.clone() {
+        match generate_local_openai_output(&params, local_config).await {
+            Ok(events) => {
+                let local_stream = futures_util::stream::iter(events.into_iter().map(Ok));
+                let output_stream = local_stream.take_until(cancellation_rx);
+                return Ok(Box::pin(output_stream));
+            }
+            Err(error) => {
+                log::warn!("Local OpenAI request failed: {error:?}");
+                if !params.local_openai_fallback_to_warp {
+                    let (tx, rx) = async_channel::unbounded();
+                    let _ = tx.send(Err(Arc::new(error))).await;
+                    return Ok(Box::pin(rx));
+                }
+                log::info!("Falling back to Warp-hosted multi-agent endpoint.");
+            }
+        }
+    }
+
     let supported_tools = params
         .supported_tools_override
         .take()
@@ -141,6 +165,166 @@ pub async fn generate_multi_agent_output(
             Ok(Box::pin(rx))
         }
     }
+}
+
+#[derive(Debug, Serialize)]
+struct LocalOpenAIRequestBody {
+    model: String,
+    messages: Vec<LocalOpenAIMessage>,
+    stream: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct LocalOpenAIMessage {
+    role: &'static str,
+    content: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct LocalOpenAIChatResponse {
+    choices: Vec<LocalOpenAIChoice>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LocalOpenAIChoice {
+    message: Option<LocalOpenAIMessageResponse>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LocalOpenAIMessageResponse {
+    content: Option<String>,
+}
+
+async fn generate_local_openai_output(
+    params: &RequestParams,
+    local_config: ai::api_keys::LocalOpenAIConfig,
+) -> Result<Vec<api::ResponseEvent>, AIApiError> {
+    let user_query = extract_user_query(&params.input).unwrap_or_else(|| "Continue".to_string());
+    let model = local_config
+        .model
+        .unwrap_or_else(|| params.model.to_string());
+    let endpoint = format!(
+        "{}/chat/completions",
+        local_config.base_url.trim_end_matches('/')
+    );
+    let request_body = LocalOpenAIRequestBody {
+        model,
+        messages: vec![LocalOpenAIMessage {
+            role: "user",
+            content: user_query,
+        }],
+        stream: false,
+    };
+    let client = reqwest::Client::new();
+    let mut request = client.post(endpoint).json(&request_body);
+    if let Some(api_key) = local_config.api_key {
+        request = request.bearer_auth(api_key);
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|err| {
+            if err.is_timeout() {
+                AIApiError::Other(anyhow::anyhow!("Local OpenAI-compatible endpoint timed out"))
+            } else if err.is_connect() {
+                AIApiError::Other(anyhow::anyhow!(
+                    "Could not connect to local OpenAI-compatible endpoint"
+                ))
+            } else {
+                AIApiError::Other(anyhow::Error::from(err))
+            }
+        })?;
+    let response = response
+        .error_for_status()
+        .map_err(|err| {
+            let status = err.status().map(|code| code.to_string()).unwrap_or_default();
+            AIApiError::Other(anyhow::anyhow!(
+                "Local OpenAI-compatible endpoint returned HTTP status {status}"
+            ))
+        })?;
+    let parsed: LocalOpenAIChatResponse = response
+        .json()
+        .await
+        .map_err(|err| AIApiError::Other(anyhow::Error::from(err)))?;
+    let text = parsed
+        .choices
+        .into_iter()
+        .find_map(|choice| choice.message.and_then(|message| message.content))
+        .filter(|content| !content.trim().is_empty())
+        .ok_or_else(|| {
+            AIApiError::Other(anyhow::anyhow!(
+                "Local OpenAI-compatible response did not include assistant text content"
+            ))
+        })?;
+
+    let request_id = Uuid::new_v4().to_string();
+    let task_id = params
+        .tasks
+        .first()
+        .map(|task| task.id.clone())
+        .unwrap_or_else(|| "root-task".to_string());
+    let conversation_id = params
+        .conversation_token
+        .as_ref()
+        .map(|token| token.as_str().to_string())
+        .unwrap_or_default();
+    let message = api::Message {
+        id: Uuid::new_v4().to_string(),
+        task_id: task_id.clone(),
+        server_message_data: String::new(),
+        citations: vec![],
+        message: Some(api::message::Message::AgentOutput(api::message::AgentOutput {
+            text,
+        })),
+        request_id: request_id.clone(),
+        timestamp: None,
+    };
+
+    Ok(vec![
+        api::ResponseEvent {
+            r#type: Some(api::response_event::Type::Init(api::response_event::StreamInit {
+                request_id,
+                conversation_id,
+                run_id: String::new(),
+            })),
+        },
+        api::ResponseEvent {
+            r#type: Some(api::response_event::Type::ClientActions(
+                api::response_event::ClientActions {
+                    actions: vec![api::ClientAction {
+                        action: Some(api::client_action::Action::AddMessagesToTask(
+                            api::client_action::AddMessagesToTask {
+                                task_id,
+                                messages: vec![message],
+                            },
+                        )),
+                    }],
+                },
+            )),
+        },
+        api::ResponseEvent {
+            r#type: Some(api::response_event::Type::Finished(
+                api::response_event::StreamFinished {
+                    reason: Some(api::response_event::stream_finished::Reason::Done(
+                        api::response_event::stream_finished::Done {},
+                    )),
+                    conversation_usage_metadata: None,
+                    token_usage: vec![],
+                    should_refresh_model_config: false,
+                    request_cost: None,
+                },
+            )),
+        },
+    ])
+}
+
+fn extract_user_query(inputs: &[AIAgentInput]) -> Option<String> {
+    inputs.iter().rev().find_map(|input| match input {
+        AIAgentInput::UserQuery { query, .. }
+        | AIAgentInput::AutoCodeDiffQuery { query, .. }
+        | AIAgentInput::CreateNewProject { query, .. } => Some(query.trim().to_string()),
+        _ => None,
+    })
 }
 
 fn get_supported_tools(params: &RequestParams) -> Vec<api::ToolType> {

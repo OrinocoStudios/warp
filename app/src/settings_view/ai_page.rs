@@ -28,7 +28,8 @@ use crate::settings::{
     AgentModeCommandExecutionPredicate, AgentModeQuerySuggestionsEnabled, AwsBedrockAutoLogin,
     AwsBedrockCredentialsEnabled, CanUseWarpCreditsWithByok, CodeSettings, CodebaseContextEnabled,
     FileBasedMcpEnabled, GitOperationsAutogenEnabled, IncludeAgentCommandsInHistory,
-    IntelligentAutosuggestionsEnabled, MemoryEnabled, NLDInTerminalEnabled,
+    IntelligentAutosuggestionsEnabled, LocalOpenAIEnabled, LocalOpenAIFallbackToWarp,
+    MemoryEnabled, NLDInTerminalEnabled,
     NaturalLanguageAutosuggestionsEnabled, OrchestrationEnabled, RuleSuggestionsEnabled,
     SharedBlockTitleGenerationEnabled, ShouldRenderCLIAgentToolbar,
     ShouldRenderUseAgentToolbarForUserCommands, ShouldShowOzUpdatesInZeroState, ShowAgentTips,
@@ -140,6 +141,7 @@ use std::collections::HashMap;
 use std::ops::Not;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
+use url::Url;
 
 const CONTENT_FONT_SIZE: f32 = 12.;
 const PRIMARY_HEADER_FONT_SIZE: f32 = 24.;
@@ -2070,6 +2072,8 @@ pub enum AISettingsPageAction {
     ToggleUseAgentToolbar,
     ToggleVoiceInput,
     ToggleCanUseWarpCreditsWithByok,
+    ToggleLocalOpenAIEnabled,
+    ToggleLocalOpenAIFallbackToWarp,
     HyperlinkClick(HyperlinkUrl),
     ToggleCodebaseContext,
     ToggleShowInputHintText,
@@ -2460,6 +2464,36 @@ impl TypedActionView for AISettingsPageView {
                         .can_use_warp_credits_with_byok
                         .toggle_and_save_value(ctx));
                 });
+                ctx.notify();
+            }
+            AISettingsPageAction::ToggleLocalOpenAIEnabled => {
+                let new_value = AISettings::handle(ctx).update(ctx, |settings, ctx| {
+                    settings.local_openai_enabled.toggle_and_save_value(ctx)
+                });
+                if let Ok(new_value) = new_value {
+                    send_telemetry_from_ctx!(
+                        TelemetryEvent::FeaturesPageAction {
+                            action: "ToggleLocalOpenAIEnabled".to_string(),
+                            value: new_value.to_string(),
+                        },
+                        ctx
+                    );
+                }
+                ctx.notify();
+            }
+            AISettingsPageAction::ToggleLocalOpenAIFallbackToWarp => {
+                let new_value = AISettings::handle(ctx).update(ctx, |settings, ctx| {
+                    settings.local_openai_fallback_to_warp.toggle_and_save_value(ctx)
+                });
+                if let Ok(new_value) = new_value {
+                    send_telemetry_from_ctx!(
+                        TelemetryEvent::FeaturesPageAction {
+                            action: "ToggleLocalOpenAIFallbackToWarp".to_string(),
+                            value: new_value.to_string(),
+                        },
+                        ctx
+                    );
+                }
                 ctx.notify();
             }
             AISettingsPageAction::HyperlinkClick(hyperlink) => {
@@ -5968,12 +6002,37 @@ struct ApiKeysWidget {
     openai_api_key_editor: ViewHandle<EditorView>,
     anthropic_api_key_editor: ViewHandle<EditorView>,
     google_api_key_editor: ViewHandle<EditorView>,
+    local_openai_base_url_editor: ViewHandle<EditorView>,
+    local_openai_api_key_editor: ViewHandle<EditorView>,
+    local_openai_model_editor: ViewHandle<EditorView>,
 
     can_use_warp_credits_with_byok: SwitchStateHandle,
+    local_openai_enabled: SwitchStateHandle,
+    local_openai_fallback_to_warp: SwitchStateHandle,
     upgrade_highlight_index: HighlightedHyperlink,
 }
 
 impl ApiKeysWidget {
+    fn normalize_local_openai_base_url(raw: String) -> Option<String> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let Ok(parsed) = Url::parse(trimmed) else {
+            return None;
+        };
+        if parsed.scheme() != "http" && parsed.scheme() != "https" {
+            return None;
+        }
+        let Some(host) = parsed.host_str() else {
+            return None;
+        };
+        if host != "localhost" && host != "127.0.0.1" && host != "::1" {
+            return None;
+        }
+        Some(trimmed.trim_end_matches('/').to_string())
+    }
+
     fn new(ctx: &mut ViewContext<<Self as SettingsWidget>::View>) -> Self {
         let ai_settings = AISettings::as_ref(ctx);
         let workspace_handle = UserWorkspaces::handle(ctx);
@@ -5984,6 +6043,9 @@ impl ApiKeysWidget {
             openai: openai_key,
             anthropic: anthropic_key,
             google: google_key,
+            local_openai_base_url,
+            local_openai_api_key,
+            local_openai_model,
             ..
         } = ApiKeyManager::as_ref(ctx).keys().clone();
 
@@ -6072,12 +6134,161 @@ impl ApiKeysWidget {
             "AIzaSy..."
         );
 
+        let local_openai_base_url_editor = ctx.add_typed_action_view(move |ctx| {
+            let appearance = Appearance::handle(ctx).as_ref(ctx);
+            let options = SingleLineEditorOptions {
+                is_password: false,
+                text: TextOptions {
+                    font_size_override: Some(appearance.ui_font_size()),
+                    font_family_override: Some(appearance.monospace_font_family()),
+                    text_colors_override: Some(TextColors {
+                        default_color: appearance.theme().active_ui_text_color(),
+                        disabled_color: appearance.theme().disabled_ui_text_color(),
+                        hint_color: appearance.theme().disabled_ui_text_color(),
+                    }),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut editor = EditorView::single_line(options, ctx);
+            editor.set_placeholder_text("http://localhost:1234/v1", ctx);
+            if let Some(base_url) = &local_openai_base_url {
+                editor.set_buffer_text(base_url, ctx);
+            }
+            editor
+        });
+        AISettingsPageView::update_editor_interaction_state(
+            local_openai_base_url_editor.clone(),
+            is_any_ai_enabled,
+            ctx,
+        );
+        ctx.subscribe_to_view(&local_openai_base_url_editor, |_, editor, event, ctx| {
+            if matches!(event, EditorEvent::Blurred | EditorEvent::Enter) {
+                let value = editor.as_ref(ctx).buffer_text(ctx);
+                let normalized = Self::normalize_local_openai_base_url(value.clone());
+                if value.trim().is_empty() {
+                    ApiKeyManager::handle(ctx).update(ctx, |model, ctx| {
+                        model.set_local_openai_base_url(None, ctx);
+                    });
+                    send_telemetry_from_ctx!(
+                        TelemetryEvent::FeaturesPageAction {
+                            action: "LocalOpenAIBaseUrlSaved".to_string(),
+                            value: "cleared".to_string(),
+                        },
+                        ctx
+                    );
+                    return;
+                }
+                if let Some(base_url) = normalized {
+                    ApiKeyManager::handle(ctx).update(ctx, |model, ctx| {
+                        model.set_local_openai_base_url(Some(base_url), ctx);
+                    });
+                    send_telemetry_from_ctx!(
+                        TelemetryEvent::FeaturesPageAction {
+                            action: "LocalOpenAIBaseUrlSaved".to_string(),
+                            value: "valid".to_string(),
+                        },
+                        ctx
+                    );
+                } else {
+                    send_telemetry_from_ctx!(
+                        TelemetryEvent::FeaturesPageAction {
+                            action: "LocalOpenAIBaseUrlSaved".to_string(),
+                            value: "invalid".to_string(),
+                        },
+                        ctx
+                    );
+                }
+            }
+        });
+
+        let local_openai_api_key_editor = ctx.add_typed_action_view(move |ctx| {
+            let appearance = Appearance::handle(ctx).as_ref(ctx);
+            let options = SingleLineEditorOptions {
+                is_password: true,
+                text: TextOptions {
+                    font_size_override: Some(appearance.ui_font_size()),
+                    font_family_override: Some(appearance.monospace_font_family()),
+                    text_colors_override: Some(TextColors {
+                        default_color: appearance.theme().active_ui_text_color(),
+                        disabled_color: appearance.theme().disabled_ui_text_color(),
+                        hint_color: appearance.theme().disabled_ui_text_color(),
+                    }),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut editor = EditorView::single_line(options, ctx);
+            editor.set_placeholder_text("Optional", ctx);
+            if let Some(api_key) = &local_openai_api_key {
+                editor.set_buffer_text(api_key, ctx);
+            }
+            editor
+        });
+        AISettingsPageView::update_editor_interaction_state(
+            local_openai_api_key_editor.clone(),
+            is_any_ai_enabled,
+            ctx,
+        );
+        ctx.subscribe_to_view(&local_openai_api_key_editor, |_, editor, event, ctx| {
+            if matches!(event, EditorEvent::Blurred | EditorEvent::Enter) {
+                let value = editor.as_ref(ctx).buffer_text(ctx);
+                let api_key = value.trim().is_empty().not().then_some(value);
+                ApiKeyManager::handle(ctx).update(ctx, |api_key_manager, ctx| {
+                    api_key_manager.set_local_openai_api_key(api_key, ctx);
+                });
+            }
+        });
+
+        let local_openai_model_editor = ctx.add_typed_action_view(move |ctx| {
+            let appearance = Appearance::handle(ctx).as_ref(ctx);
+            let options = SingleLineEditorOptions {
+                is_password: false,
+                text: TextOptions {
+                    font_size_override: Some(appearance.ui_font_size()),
+                    font_family_override: Some(appearance.monospace_font_family()),
+                    text_colors_override: Some(TextColors {
+                        default_color: appearance.theme().active_ui_text_color(),
+                        disabled_color: appearance.theme().disabled_ui_text_color(),
+                        hint_color: appearance.theme().disabled_ui_text_color(),
+                    }),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut editor = EditorView::single_line(options, ctx);
+            editor.set_placeholder_text("gpt-4o-mini", ctx);
+            if let Some(model) = &local_openai_model {
+                editor.set_buffer_text(model, ctx);
+            }
+            editor
+        });
+        AISettingsPageView::update_editor_interaction_state(
+            local_openai_model_editor.clone(),
+            is_any_ai_enabled,
+            ctx,
+        );
+        ctx.subscribe_to_view(&local_openai_model_editor, |_, editor, event, ctx| {
+            if matches!(event, EditorEvent::Blurred | EditorEvent::Enter) {
+                let value = editor.as_ref(ctx).buffer_text(ctx);
+                let model = value.trim().is_empty().not().then_some(value);
+                ApiKeyManager::handle(ctx).update(ctx, |api_key_manager, ctx| {
+                    api_key_manager.set_local_openai_model(model, ctx);
+                });
+            }
+        });
+
         Self {
             openai_api_key_editor,
             anthropic_api_key_editor,
             google_api_key_editor,
+            local_openai_base_url_editor,
+            local_openai_api_key_editor,
+            local_openai_model_editor,
 
             can_use_warp_credits_with_byok: Default::default(),
+            local_openai_enabled: Default::default(),
+            local_openai_fallback_to_warp: Default::default(),
             upgrade_highlight_index: Default::default(),
         }
     }
@@ -6163,6 +6374,27 @@ impl ApiKeysWidget {
             "Google API Key",
             self.google_api_key_editor.clone(),
             is_enabled,
+            app,
+        ));
+        column.add_child(render_api_key_input(
+            appearance,
+            "Local OpenAI Base URL",
+            self.local_openai_base_url_editor.clone(),
+            ai_settings.is_any_ai_enabled(app),
+            app,
+        ));
+        column.add_child(render_api_key_input(
+            appearance,
+            "Local OpenAI API Key (optional)",
+            self.local_openai_api_key_editor.clone(),
+            ai_settings.is_any_ai_enabled(app),
+            app,
+        ));
+        column.add_child(render_api_key_input(
+            appearance,
+            "Default Local Model",
+            self.local_openai_model_editor.clone(),
+            ai_settings.is_any_ai_enabled(app),
             app,
         ));
 
@@ -6255,13 +6487,53 @@ impl ApiKeysWidget {
             .with_child(description)
             .finish()
     }
+
+    fn render_local_openai_toggles(
+        &self,
+        view: &AISettingsPageView,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        let ai_settings = AISettings::as_ref(app);
+        let enabled = ai_settings.is_any_ai_enabled(app);
+
+        let local_enabled_toggle = render_ai_setting_toggle::<LocalOpenAIEnabled>(
+            "Use local OpenAI-compatible provider",
+            AISettingsPageAction::ToggleLocalOpenAIEnabled,
+            *ai_settings.local_openai_enabled,
+            enabled,
+            self.local_openai_enabled.clone(),
+            &view.local_only_icon_tooltip_states,
+            app,
+        );
+        let local_fallback_toggle = render_ai_setting_toggle::<LocalOpenAIFallbackToWarp>(
+            "Fallback to Warp models when local fails",
+            AISettingsPageAction::ToggleLocalOpenAIFallbackToWarp,
+            *ai_settings.local_openai_fallback_to_warp,
+            enabled,
+            self.local_openai_fallback_to_warp.clone(),
+            &view.local_only_icon_tooltip_states,
+            app,
+        );
+        let description = render_ai_setting_description(
+            "Local endpoint URL must be http/https and loopback-only (localhost, 127.0.0.1, or ::1).",
+            enabled,
+            app,
+        );
+
+        Flex::column()
+            .with_spacing(8.)
+            .with_child(local_enabled_toggle)
+            .with_child(local_fallback_toggle)
+            .with_child(description)
+            .finish()
+    }
 }
 
 impl SettingsWidget for ApiKeysWidget {
     type View = AISettingsPageView;
 
     fn search_terms(&self) -> &str {
-        "api keys bring your own byo openai anthropic google claude gemini gpt"
+        "api keys bring your own byo openai anthropic google claude gemini gpt local localhost lm studio vllm localai"
     }
 
     fn render(
@@ -6294,6 +6566,11 @@ impl SettingsWidget for ApiKeysWidget {
                     .finish(),
             );
         }
+        column.add_child(
+            Container::new(self.render_local_openai_toggles(view, app))
+                .with_margin_top(16.)
+                .finish(),
+        );
 
         Container::new(column.finish())
             .with_margin_bottom(HEADER_PADDING)

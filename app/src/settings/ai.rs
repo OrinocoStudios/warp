@@ -1203,6 +1203,26 @@ define_settings_group!(AISettings, settings: [
         toml_path: "cloud_platform.third_party_api_keys.can_use_warp_credits_with_byok",
         description: "Whether Warp credits can be used even when providing your own API key.",
     }
+    // Whether to route Agent Mode requests to a local OpenAI-compatible endpoint.
+    local_openai_enabled: LocalOpenAIEnabled {
+        type: bool,
+        default: false,
+        supported_platforms: SupportedPlatforms::DESKTOP,
+        sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+        private: false,
+        toml_path: "cloud_platform.third_party_api_keys.local_openai_enabled",
+        description: "Whether requests should use a locally configured OpenAI-compatible endpoint.",
+    }
+    // Whether to fall back to Warp-hosted models if the local endpoint fails.
+    local_openai_fallback_to_warp: LocalOpenAIFallbackToWarp {
+        type: bool,
+        default: false,
+        supported_platforms: SupportedPlatforms::DESKTOP,
+        sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+        private: false,
+        toml_path: "cloud_platform.third_party_api_keys.local_openai_fallback_to_warp",
+        description: "Whether to automatically fall back to Warp-hosted models when the local endpoint is unavailable.",
+    }
 
     should_render_use_agent_footer_for_user_commands: ShouldRenderUseAgentToolbarForUserCommands {
         type: bool,

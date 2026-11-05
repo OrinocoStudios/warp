@@ -22,6 +22,9 @@ pub struct ApiKeys {
     pub anthropic: Option<String>,
     pub openai: Option<String>,
     pub open_router: Option<String>,
+    pub local_openai_base_url: Option<String>,
+    pub local_openai_api_key: Option<String>,
+    pub local_openai_model: Option<String>,
 }
 
 impl ApiKeys {
@@ -31,6 +34,13 @@ impl ApiKeys {
             || self.google.is_some()
             || self.open_router.is_some()
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalOpenAIConfig {
+    pub base_url: String,
+    pub api_key: Option<String>,
+    pub model: Option<String>,
 }
 
 /// Controls how AWS credentials are refreshed by [`ApiKeyManager`].
@@ -91,6 +101,59 @@ impl ApiKeyManager {
         self.keys.open_router = key;
         ctx.emit(ApiKeyManagerEvent::KeysUpdated);
         self.write_keys_to_secure_storage(ctx);
+    }
+
+    pub fn set_local_openai_base_url(&mut self, base_url: Option<String>, ctx: &mut ModelContext<Self>) {
+        self.keys.local_openai_base_url = base_url;
+        ctx.emit(ApiKeyManagerEvent::KeysUpdated);
+        self.write_keys_to_secure_storage(ctx);
+    }
+
+    pub fn set_local_openai_api_key(&mut self, api_key: Option<String>, ctx: &mut ModelContext<Self>) {
+        self.keys.local_openai_api_key = api_key;
+        ctx.emit(ApiKeyManagerEvent::KeysUpdated);
+        self.write_keys_to_secure_storage(ctx);
+    }
+
+    pub fn set_local_openai_model(&mut self, model: Option<String>, ctx: &mut ModelContext<Self>) {
+        self.keys.local_openai_model = model;
+        ctx.emit(ApiKeyManagerEvent::KeysUpdated);
+        self.write_keys_to_secure_storage(ctx);
+    }
+
+    pub fn local_openai_config(&self, is_enabled: bool) -> Option<LocalOpenAIConfig> {
+        if !is_enabled {
+            return None;
+        }
+        let base_url = self
+            .keys
+            .local_openai_base_url
+            .clone()
+            .and_then(|value| {
+                let trimmed = value.trim().to_string();
+                (!trimmed.is_empty()).then_some(trimmed)
+            })?;
+        let api_key = self
+            .keys
+            .local_openai_api_key
+            .clone()
+            .and_then(|value| {
+                let trimmed = value.trim().to_string();
+                (!trimmed.is_empty()).then_some(trimmed)
+            });
+        let model = self
+            .keys
+            .local_openai_model
+            .clone()
+            .and_then(|value| {
+                let trimmed = value.trim().to_string();
+                (!trimmed.is_empty()).then_some(trimmed)
+            });
+        Some(LocalOpenAIConfig {
+            base_url,
+            api_key,
+            model,
+        })
     }
 
     pub fn set_aws_credentials_state(
@@ -217,3 +280,51 @@ impl Entity for ApiKeyManager {
 }
 
 impl SingletonEntity for ApiKeyManager {}
+
+#[cfg(test)]
+mod tests {
+    use super::{ApiKeys, ApiKeyManager, LocalOpenAIConfig};
+
+    #[test]
+    fn api_keys_serialization_includes_local_openai_fields() {
+        let keys = ApiKeys {
+            google: Some("g".to_string()),
+            anthropic: None,
+            openai: Some("o".to_string()),
+            open_router: None,
+            local_openai_base_url: Some("http://localhost:1234/v1".to_string()),
+            local_openai_api_key: Some("local-key".to_string()),
+            local_openai_model: Some("local-model".to_string()),
+        };
+        let serialized = serde_json::to_string(&keys).expect("serialize api keys");
+        let parsed: ApiKeys = serde_json::from_str(&serialized).expect("deserialize api keys");
+
+        assert_eq!(parsed.local_openai_base_url.as_deref(), Some("http://localhost:1234/v1"));
+        assert_eq!(parsed.local_openai_api_key.as_deref(), Some("local-key"));
+        assert_eq!(parsed.local_openai_model.as_deref(), Some("local-model"));
+    }
+
+    #[test]
+    fn local_openai_config_requires_enabled_and_base_url() {
+        let manager = ApiKeyManager {
+            keys: ApiKeys {
+                local_openai_base_url: Some(" http://localhost:11434/v1 ".to_string()),
+                local_openai_api_key: Some(" ".to_string()),
+                local_openai_model: Some(" gpt-local ".to_string()),
+                ..Default::default()
+            },
+            aws_credentials_state: Default::default(),
+            aws_credentials_refresh_strategy: Default::default(),
+        };
+
+        assert_eq!(manager.local_openai_config(false), None);
+        assert_eq!(
+            manager.local_openai_config(true),
+            Some(LocalOpenAIConfig {
+                base_url: "http://localhost:11434/v1".to_string(),
+                api_key: None,
+                model: Some("gpt-local".to_string()),
+            })
+        );
+    }
+}

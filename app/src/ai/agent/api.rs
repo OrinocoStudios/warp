@@ -4,7 +4,7 @@ mod convert_to;
 mod r#impl;
 
 pub use ai::agent::convert::ConvertToAPITypeError;
-use ai::api_keys::ApiKeyManager;
+use ai::api_keys::{ApiKeyManager, LocalOpenAIConfig};
 pub use convert_from::{
     user_inputs_from_messages, ConversionParams, ConvertAPIMessageToClientOutputMessage,
     MaybeAIAgentOutputMessage, MessageToAIAgentOutputMessageError,
@@ -116,6 +116,8 @@ pub struct RequestParams {
     /// User-provided API keys for AI providers (BYO API Key).
     pub api_keys: Option<warp_multi_agent_api::request::settings::ApiKeys>,
     pub allow_use_of_warp_credits_with_byok: bool,
+    pub local_openai_config: Option<LocalOpenAIConfig>,
+    pub local_openai_fallback_to_warp: bool,
     pub autonomy_level: warp_multi_agent_api::AutonomyLevel,
     pub isolation_level: warp_multi_agent_api::IsolationLevel,
     pub web_search_enabled: bool,
@@ -237,8 +239,11 @@ impl RequestParams {
             user_workspaces.is_byo_api_key_enabled(),
             user_workspaces.is_aws_bedrock_credentials_enabled(app),
         );
+        let local_openai_config = ApiKeyManager::as_ref(app)
+            .local_openai_config(*ai_settings.local_openai_enabled);
         let allow_use_of_warp_credits_with_byok =
             *AISettings::as_ref(app).can_use_warp_credits_with_byok;
+        let local_openai_fallback_to_warp = *ai_settings.local_openai_fallback_to_warp;
 
         let app_execution_mode = AppExecutionMode::as_ref(app);
         let autonomy_level = if app_execution_mode.is_autonomous() {
@@ -299,6 +304,8 @@ impl RequestParams {
             should_redact_secrets,
             api_keys,
             allow_use_of_warp_credits_with_byok,
+            local_openai_config,
+            local_openai_fallback_to_warp,
             autonomy_level,
             isolation_level,
             web_search_enabled,

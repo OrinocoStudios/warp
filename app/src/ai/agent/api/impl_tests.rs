@@ -1,10 +1,12 @@
 use crate::ai::agent::api::RequestParams;
+use crate::ai::agent::AIAgentInput;
 use crate::ai::blocklist::SessionContext;
 use crate::ai::llms::LLMId;
+use std::collections::HashMap;
 use warp_core::features::FeatureFlag;
 use warp_multi_agent_api as api;
 
-use super::get_supported_tools;
+use super::{extract_user_query, get_supported_tools};
 
 fn request_params_with_ask_user_question_enabled(ask_user_question_enabled: bool) -> RequestParams {
     let model = LLMId::from("test-model");
@@ -29,6 +31,8 @@ fn request_params_with_ask_user_question_enabled(ask_user_question_enabled: bool
         should_redact_secrets: false,
         api_keys: None,
         allow_use_of_warp_credits_with_byok: false,
+        local_openai_config: None,
+        local_openai_fallback_to_warp: false,
         autonomy_level: api::AutonomyLevel::Supervised,
         isolation_level: api::IsolationLevel::None,
         web_search_enabled: false,
@@ -78,4 +82,25 @@ fn supported_tools_omit_upload_artifact_when_feature_flag_is_disabled() {
     let supported_tools = get_supported_tools(&params);
 
     assert!(!supported_tools.contains(&api::ToolType::UploadFileArtifact));
+}
+
+#[test]
+fn extract_user_query_prefers_latest_user_facing_query() {
+    let inputs = vec![
+        AIAgentInput::UserQuery {
+            query: "first".to_string(),
+            context: Default::default(),
+            static_query_type: None,
+            referenced_attachments: HashMap::new(),
+            user_query_mode: Default::default(),
+            running_command: None,
+            intended_agent: None,
+        },
+        AIAgentInput::CreateNewProject {
+            query: "latest".to_string(),
+            context: Default::default(),
+        },
+    ];
+
+    assert_eq!(extract_user_query(&inputs).as_deref(), Some("latest"));
 }
